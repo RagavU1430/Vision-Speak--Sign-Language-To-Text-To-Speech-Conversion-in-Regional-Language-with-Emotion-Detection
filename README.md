@@ -1,0 +1,2 @@
+# Vision-Speak--Sign-Language-To-Text-To-Speech-Conversion-in-Regional-Language-with-Emotion-Detection
+VisionSpeak is a real-time Sign Language Recognition system that uses MediaPipe hand tracking and an MLP model to recognize ASL gestures, automatically form words, and convert them into speech. Features include stable gesture detection, auto letter capture, word building, and text-to-speech communication.
