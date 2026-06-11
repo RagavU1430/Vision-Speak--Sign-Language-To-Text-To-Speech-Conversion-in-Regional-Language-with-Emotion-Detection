@@ -50,9 +50,17 @@ os.environ["GLOG_minloglevel"] = "3"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 warnings.filterwarnings("ignore")
 
+# ── Monkeypatch httpcore for googletrans compatibility ──────────────────────
+import httpcore
+if not hasattr(httpcore, "SyncHTTPTransport"):
+    class DummySyncHTTPTransport:
+        pass
+    httpcore.SyncHTTPTransport = DummySyncHTTPTransport
+
 # ── Imports ─────────────────────────────────────────────────────────────────
 import sys
 import time
+import functools
 import threading
 import numpy as np
 import cv2
@@ -172,6 +180,50 @@ TRANSLATION_DICT = {
 }
 
 
+# ── Global Translator & Cache for Real-Time Translation ──────────────────────
+_google_translator = None
+_translation_cache = {}
+
+def translate_to_tamil(text: str) -> str:
+    """
+    Translates English text to Tamil using googletrans==4.0.0rc1.
+    Utilizes local dictionary mapping first, then memory cache, and finally 
+    falls back to the googletrans API to prevent UI freezing and API limit issues.
+    """
+    global _google_translator
+    if not text or not text.strip():
+        return text
+
+    cleaned_text = text.strip()
+    upper_text = cleaned_text.upper()
+
+    # 1. Try local dictionary lookup first (instant & offline-friendly)
+    lang_dict = TRANSLATION_DICT.get("Tamil", {})
+    if upper_text in lang_dict:
+        return lang_dict[upper_text]
+
+    # 2. Check memory cache for previous translations
+    if cleaned_text in _translation_cache:
+        return _translation_cache[cleaned_text]
+
+    # 3. Call googletrans API
+    try:
+        if _google_translator is None:
+            from googletrans import Translator
+            _google_translator = Translator()
+        
+        result = _google_translator.translate(cleaned_text, src='en', dest='ta')
+        if result and result.text:
+            _translation_cache[cleaned_text] = result.text
+            return result.text
+    except Exception as e:
+        print(f"[WARN] googletrans translation failed: {e}")
+
+    # Cache original text on failure to prevent spamming the API on every frame
+    _translation_cache[cleaned_text] = text
+    return text
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Translation Engine (modular design for multilingual support)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -180,7 +232,7 @@ class TranslationEngine:
     """
     Modular translation engine supporting English → target language.
 
-    Currently uses dictionary-based translation for Tamil.
+    Currently uses googletrans-based translation for Tamil with local dictionary backup.
     Designed to seamlessly integrate API-based translation (Google Translate,
     DeepL, etc.) without refactoring the calling code.
 
@@ -205,6 +257,9 @@ class TranslationEngine:
         if not self.is_active or not text:
             return text
 
+        if self.target_lang == "Tamil":
+            return translate_to_tamil(text)
+
         lang_dict = TRANSLATION_DICT.get(self.target_lang, {})
         upper_text = text.upper().strip()
 
@@ -223,7 +278,7 @@ class TranslationEngine:
 
         result = " ".join(translated_words)
 
-        # 3. If no dictionary match at all, try API (placeholder)
+        # 3. If no dictionary match at all, try API (fallback)
         if result == upper_text and upper_text:
             result = self._api_translate(text)
 
@@ -615,17 +670,16 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
     h, w = frame.shape[:2]
 
     # ── Top-left: Title bar ─────────────────────────────────────────────────
-    draw_rounded_rect(frame, (10, 10), (500, 55), BG_DARK, radius=12, alpha=0.85)
+    draw_rounded_rect(frame, (10, 10), (560, 55), BG_DARK, radius=12, alpha=0.85)
     cv2.putText(frame, "ASL Sign Language", (24, 42),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, TEAL, 2, cv2.LINE_AA)
 
     # Language indicator
-    lang_display = "EN" if selected_language == "English" else "தமிழ்"
     lang_color = TEAL if selected_language == "English" else ORANGE
-    cv2.putText(frame, f"Lang: {selected_language}", (200, 42),
+    cv2.putText(frame, f"Language: {selected_language}", (220, 42),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, lang_color, 1, cv2.LINE_AA)
 
-    cv2.putText(frame, f"FPS: {fps:.0f}", (340, 42),
+    cv2.putText(frame, f"FPS: {fps:.0f}", (390, 42),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, GRAY, 1, cv2.LINE_AA)
 
     # Speech status indicator (top bar, right of FPS)
@@ -757,12 +811,16 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
     draw_rounded_rect(frame, (10, sent_bar_y), (w - 10, sent_bar_y + sent_bar_h),
                       BG_DARK, radius=12, alpha=0.80)
 
-    cv2.putText(frame, "Sentence:", (24, sent_bar_y + 30),
+    # Label changes to "English:" in Tamil mode
+    sent_label = "English:" if selected_language == "Tamil" else "Sentence:"
+    cv2.putText(frame, sent_label, (24, sent_bar_y + 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, PURPLE, 1, cv2.LINE_AA)
 
     sentence_text = " ".join(sentence_buffer) if sentence_buffer else "(press SPACE to finish words)"
     sent_color = WHITE if sentence_buffer else GRAY
-    cv2.putText(frame, sentence_text, (120, sent_bar_y + 30),
+    # Position text slightly to the left if using shorter "English:" label
+    text_x_pos = 100 if selected_language == "Tamil" else 120
+    cv2.putText(frame, sentence_text, (text_x_pos, sent_bar_y + 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, sent_color, 1, cv2.LINE_AA)
 
     # ── Word buffer (bottom bar) ────────────────────────────────────────────
@@ -1127,11 +1185,10 @@ def main():
                 tts_language = selected_language
 
                 if selected_language == "Tamil":
+                    speak_text = translated
                     if translated != full_sentence:
-                        speak_text = translated
                         print(f"[TAMIL] Translated: {translated}")
                     else:
-                        speak_text = full_sentence
                         print("[TAMIL] No translation found, speaking English.")
                 else:
                     speak_text = full_sentence
@@ -1143,15 +1200,10 @@ def main():
                     feedback_timestamp = now
 
                     # Save to Supabase with language and translation info
-                    if selected_language == "Tamil" and translated != full_sentence:
-                        save_recognition(recognized_text=full_sentence,
-                                         translated_text=translated,
-                                         selected_language=selected_language,
-                                         confidence=avg_conf)
-                    else:
-                        save_recognition(recognized_text=full_sentence,
-                                         selected_language=selected_language,
-                                         confidence=avg_conf)
+                    save_recognition(recognized_text=full_sentence,
+                                     translated_text=translated if selected_language == "Tamil" else "",
+                                     selected_language=selected_language,
+                                     confidence=avg_conf)
             else:
                 print("[TTS] No text available to speak.")
                 feedback_message = "No text to speak"
