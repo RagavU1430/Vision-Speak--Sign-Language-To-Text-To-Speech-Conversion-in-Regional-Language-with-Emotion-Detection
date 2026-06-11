@@ -339,18 +339,14 @@ class SpeechEngine:
     Production-grade TTS wrapper using pyttsx3.
 
     Architecture:
-      Spawns a fresh pyttsx3 engine in a temporary background thread for every
-      single speech request. The engine is created, used, and destroyed
-      entirely within that thread.
+      Main Thread -> speak(text) -> Queue.put(text)
+      Worker Thread -> Queue.get() -> engine.say() -> engine.runAndWait()
 
-    Why this design?
-      Creating a fresh engine and destroying it after speech prevents COM/SAPI5
-      state corruption and ensures unlimited consecutive speech requests work
-      consistently on Windows.
-
-    Status lifecycle:
-      READY → speak() called → SPEAKING → audio finishes → COMPLETED
-            → (auto 2s) → READY
+    Features:
+      - Engine is created once and kept alive for the lifetime of the application.
+      - Supports non-blocking speech with simple thread-safe queue.
+      - Prevents overlapping speech requests.
+      - Logs diagnostic properties (Worker Alive, Queue Size, Current Status, is_speaking).
     """
 
     _instance = None
@@ -379,67 +375,130 @@ class SpeechEngine:
         self._status_lock = threading.Lock()
         self._status = self.STATUS_READY
         self._is_speaking_val = False
+        self._just_completed_flag = False
         self._current_text = ""
         self._completed_timestamp = 0.0
         self._completed_display_duration = 2.0  # Show COMPLETED for 2s
         self._auto_cleared = False  # One-shot flag for auto-clear
 
+        # Queue and shutdown signal
+        self._queue = queue.Queue()
+        self._shutdown_event = threading.Event()
+
         # Engine-available flag for compatibility
         self._engine_ready = threading.Event()
-        self._engine_ready.set()
 
-        print("[OK] TTS engine interface initialized.")
+        # Launch persistent worker thread
+        self._worker_thread = threading.Thread(
+            target=self._worker_loop,
+            name="SpeechWorkerThread",
+            daemon=True
+        )
+        self._worker_thread.start()
 
-    def _speak_thread(self, text, language="English", volume=None):
-        """Background thread: handles SAPI5 COM apartment, engine init, speech, and destruction."""
+        print("[OK] TTS persistent speech engine initialized.")
+
+    def _worker_loop(self):
+        """Persistent background worker loop that handles pyttsx3 commands."""
         import pythoncom
         pythoncom.CoInitialize()
         engine = None
         try:
-            print("[DEBUG] Engine Created")
+            print("[DEBUG] Engine Created (Single Instance)")
             engine = pyttsx3.init()
             engine.setProperty("rate", TTS_SPEECH_RATE)
-            engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
-
-            # Attempt Tamil voice selection if requested
-            if language == "Tamil":
-                try:
-                    voices = engine.getProperty("voices")
-                    for voice in voices:
-                        voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
-                        voice_id = voice.id.lower() if hasattr(voice, 'id') else ""
-                        if 'tamil' in voice_name or 'ta' in voice_id or 'ta-in' in voice_id:
-                            engine.setProperty("voice", voice.id)
-                            print("[TTS] Tamil voice selected.")
-                            break
-                except Exception as ve:
-                    print(f"[TTS] Tamil voice not available, using default: {ve}")
-
-            print("[DEBUG] Speech Started")
-            engine.say(text)
-            engine.runAndWait()
-            print("[DEBUG] Speech Finished")
-
+            engine.setProperty("volume", TTS_VOLUME)
+            self._engine_ready.set()
         except Exception as e:
-            print(f"[ERROR] Exception during speech execution: {e}")
-        finally:
-            if engine is not None:
-                try:
-                    engine.stop()
-                except Exception:
-                    pass
-                del engine
-                print("[DEBUG] Engine Destroyed")
-
+            print(f"[ERROR] Failed to initialize pyttsx3 engine: {e}")
             pythoncom.CoUninitialize()
+            return
 
-            # Always update status and release speaking lock
+        while not self._shutdown_event.is_set():
+            try:
+                # Non-blocking fetch with 100ms timeout
+                request = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            text, language, volume = request
+
+            # Update state to SPEAKING
             with self._status_lock:
-                self._is_speaking_val = False
+                self._is_speaking_val = True
+                self._status = self.STATUS_SPEAKING
+                self._current_text = text
                 self._auto_cleared = False
-                self._status = self.STATUS_COMPLETED
-                self._completed_timestamp = time.time()
-            print("[DEBUG] Status Reset")
+
+            # Diagnostic logs after every request received
+            worker_alive = self._worker_thread.is_alive()
+            print(f"[DEBUG TTS] Worker Alive: {worker_alive} | Queue Size: {self._queue.qsize()} | Status: {self._status} | is_speaking: {self._is_speaking_val}")
+
+            try:
+                # Set dynamic volume override
+                engine.setProperty("volume", volume if volume is not None else TTS_VOLUME)
+
+                # Attempt Tamil voice selection if requested
+                if language == "Tamil":
+                    try:
+                        voices = engine.getProperty("voices")
+                        tamil_voice_found = False
+                        for voice in voices:
+                            voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
+                            voice_id = voice.id.lower() if hasattr(voice, 'id') else ""
+                            if 'tamil' in voice_name or 'ta' in voice_id or 'ta-in' in voice_id:
+                                engine.setProperty("voice", voice.id)
+                                print("[TTS] Tamil voice selected.")
+                                tamil_voice_found = True
+                                break
+                        if not tamil_voice_found:
+                            print("[TTS] Tamil voice not found, using default voice.")
+                    except Exception as ve:
+                        print(f"[TTS] Tamil voice selection error: {ve}")
+                else:
+                    # Reset voice to default (usually English)
+                    try:
+                        voices = engine.getProperty("voices")
+                        for voice in voices:
+                            voice_name = voice.name.lower() if hasattr(voice, 'name') else ""
+                            if 'tamil' not in voice_name:
+                                engine.setProperty("voice", voice.id)
+                                break
+                    except Exception:
+                        pass
+
+                print("[DEBUG] Speech Started")
+                engine.say(text)
+                engine.runAndWait()
+                print("[DEBUG] Speech Finished")
+
+            except Exception as e:
+                print(f"[ERROR] Exception during speech execution: {e}")
+            finally:
+                self._queue.task_done()
+
+                # Reset speaking state to COMPLETED
+                with self._status_lock:
+                    self._is_speaking_val = False
+                    self._status = self.STATUS_COMPLETED
+                    self._completed_timestamp = time.time()
+                    self._just_completed_flag = True
+                print("[DEBUG] Status Reset")
+
+                # Diagnostic logs after request processed
+                worker_alive = self._worker_thread.is_alive()
+                print(f"[DEBUG TTS] Worker Alive: {worker_alive} | Queue Size: {self._queue.qsize()} | Status: {self.status} | is_speaking: {self.is_speaking}")
+
+        # Shutdown cleanup
+        if engine is not None:
+            try:
+                engine.stop()
+            except Exception:
+                pass
+            del engine
+            print("[DEBUG] Engine Destroyed")
+
+        pythoncom.CoUninitialize()
 
     # ── Public API (called from the main/UI thread) ─────────────────────
 
@@ -467,63 +526,44 @@ class SpeechEngine:
         Calling this consumes the flag (one-shot).
         """
         with self._status_lock:
-            if (self._status == self.STATUS_COMPLETED
-                    and not self._auto_cleared):
-                self._auto_cleared = True
+            if self._just_completed_flag:
+                self._just_completed_flag = False
                 return True
             return False
 
     def speak(self, text: str, language: str = "English", volume: float = None) -> bool:
         """
-        Submit a speech request by spawning a new background thread.
+        Queue a speech request to be processed by the background worker thread.
 
         Args:
             text: The text to speak.
             language: Language for TTS voice selection ("English" or "Tamil").
             volume: Volume level override (0.0 to 1.0).
 
-        Returns True if the request was accepted, False if rejected
-        (empty text or already speaking).
+        Returns True if the request was accepted (queued), False if rejected (empty text).
         """
         print("[DEBUG] speak() called")
         if not text or not text.strip():
             print("[TTS] No text to speak.")
             return False
 
-        # Reject if already speaking (prevents overlapping speech)
-        if self.is_speaking:
-            with self._status_lock:
-                print(f"[DEBUG] Status: {self.status}")
-                print(f"[DEBUG] Current Text Being Spoken:\n{self._current_text}")
-            print("[TTS] Already speaking, ignoring request.")
-            return False
-
         clean_text = text.strip()
 
-        # Lock state and set active text before launching thread
-        with self._status_lock:
-            self._status = self.STATUS_SPEAKING
-            self._is_speaking_val = True
-            self._current_text = clean_text
-            self._auto_cleared = False
-
+        # Push to the thread-safe queue
+        self._queue.put((clean_text, language, volume))
         print("[DEBUG] Queue Accepted")
-        print(f"[DEBUG] Status: {self.status}")
-
-        # Launch speech in background thread (Fix 9)
-        t = threading.Thread(
-            target=self._speak_thread,
-            args=(clean_text, language, volume),
-            name="TTS-Request-Thread",
-            daemon=True
-        )
-        t.start()
-
+        
+        # Diagnostic logs on the main thread after queuing
+        worker_alive = self._worker_thread.is_alive()
+        print(f"[DEBUG TTS] Queue Size: {self._queue.qsize()} | Worker Alive: {worker_alive} | Status: {self.status} | is_speaking: {self.is_speaking}")
         return True
 
     def shutdown(self):
-        """Shutdown helper (noop in this design, for compatibility)."""
-        pass
+        """Set shutdown signal to clean up thread on exit."""
+        self._shutdown_event.set()
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.0)
+
 
 
 def save_recognition(recognized_text: str, translated_text: str = "",
