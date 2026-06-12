@@ -70,6 +70,7 @@ import pyttsx3
 import pythoncom
 from collections import deque, Counter
 from supabase_client import SupabaseManager
+from utils import extract_enhanced_features  # Enhanced landmarks and engineered features
 
 # ── Optional: PIL for Unicode (Tamil) text rendering ────────────────────
 try:
@@ -85,10 +86,13 @@ MODEL_PATH = os.path.join("models", "mlp_model.pkl")
 ENCODER_PATH = os.path.join("models", "label_encoder.pkl")
 SCALER_PATH = os.path.join("models", "scaler.pkl")
 
+# Compatibility / Feature mode indicator
+MODEL_EXPECTS_ENHANCED = False
+
 # ── Temporal Logic Configuration ────────────────────────────────────────────
 HISTORY_SIZE = 20             # Number of frames to keep in prediction history
 CONSISTENCY_THRESHOLD = 0.80  # >80% of history must agree for a "stable" prediction
-CONFIDENCE_THRESHOLD = 0.85   # Model confidence must exceed 90%
+CONFIDENCE_THRESHOLD = 0.95   # Model confidence must exceed 95%
 HOLD_TIME_REQUIRED = 0.5      # Seconds the prediction must be held before committing
 FEEDBACK_DISPLAY_DURATION = 1.0  # Seconds to show "Added X" confirmation
 
@@ -753,6 +757,7 @@ def share_location():
 
 def load_model():
     """Load the trained MLP model, label encoder, and scaler."""
+    global MODEL_EXPECTS_ENHANCED
     for path in (MODEL_PATH, ENCODER_PATH, SCALER_PATH):
         if not os.path.exists(path):
             print(f"[ERROR] Missing file: {path}")
@@ -762,7 +767,23 @@ def load_model():
     model = joblib.load(MODEL_PATH)
     le = joblib.load(ENCODER_PATH)
     scaler = joblib.load(SCALER_PATH)
-    print("[OK] Model, encoder, and scaler loaded.")
+
+    # Determine model input dimension dynamically
+    if hasattr(scaler, 'n_features_in_'):
+        num_feats = scaler.n_features_in_
+    elif hasattr(model, 'n_features_in_'):
+        num_feats = model.n_features_in_
+    else:
+        num_feats = 63  # default fallback
+
+    MODEL_EXPECTS_ENHANCED = (num_feats == 99)
+    print(f"[OK] Model, encoder, and scaler loaded. Expected features: {num_feats}")
+    if not MODEL_EXPECTS_ENHANCED:
+        print("[WARN] Compatibility Mode Active: Loaded model expects 63 features (raw landmarks).")
+        print("       Please run train_mlp.py to retrain the model with 99 enhanced features for maximum stability.")
+    else:
+        print("[OK] Enhanced Feature Mode Active: Using 99 normalized & engineered features.")
+
     return model, le, scaler
 
 
@@ -779,15 +800,36 @@ def extract_landmarks(hand_landmarks) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def draw_unicode_text(frame, text, position, color, font_size=24, thickness=1):
-    """Render Unicode text (Tamil, etc.) on an OpenCV frame using PIL if available."""
-    if not PIL_AVAILABLE:
+    """Render Unicode text (Tamil, etc.) on an OpenCV frame using PIL by cropping the local area for performance."""
+    if not PIL_AVAILABLE or not text:
         cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX,
                     font_size / 30, (180, 180, 180), thickness, cv2.LINE_AA)
         return
 
     try:
-        pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        h, w = frame.shape[:2]
+        x, y = position
+        
+        # Estimate text dimensions (generous padding)
+        text_h = int(font_size * 1.6)
+        text_w = int(len(text) * font_size * 1.2)
+        
+        # Define bounding box for cropping (constrain within frame boundaries)
+        x1 = max(0, x - 10)
+        y1 = max(0, y - 5)
+        x2 = min(w, x + text_w + 10)
+        y2 = min(h, y + text_h + 5)
+        
+        if x2 <= x1 or y2 <= y1:
+            return
+            
+        # Crop only the local region of interest
+        roi = frame[y1:y2, x1:x2]
+        
+        # Render text on ROI using PIL
+        pil_img = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_img)
+        
         font = None
         for font_path in [
             "C:/Windows/Fonts/Nirmala.ttf",
@@ -801,11 +843,56 @@ def draw_unicode_text(frame, text, position, color, font_size=24, thickness=1):
                 continue
         if font is None:
             font = ImageFont.load_default()
-        draw.text(position, text, font=font, fill=color)
-        frame[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+            
+        # Local text position is relative to ROI origin
+        local_pos = (x - x1, y - y1)
+        draw.text(local_pos, text, font=font, fill=color)
+        
+        # Convert back and paste onto frame
+        frame[y1:y2, x1:x2] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
     except Exception as e:
         cv2.putText(frame, text, position, cv2.FONT_HERSHEY_SIMPLEX,
                     font_size / 30, (180, 180, 180), thickness, cv2.LINE_AA)
+
+
+def check_hand_quality(hand_landmarks):
+    """
+    Checks if the hand landmarks meet quality criteria (Phase 7):
+      - Not too close to the edge (within 2% margin)
+      - Not too small (bounding box width and height >= 12% of screen)
+    """
+    xs = [lm.x for lm in hand_landmarks.landmark]
+    ys = [lm.y for lm in hand_landmarks.landmark]
+    
+    # 1. Edge check
+    edge_margin = 0.02
+    for x, y in zip(xs, ys):
+        if x < edge_margin or x > (1.0 - edge_margin) or y < edge_margin or y > (1.0 - edge_margin):
+            return False, "Hand Too Close to Edge"
+            
+    # 2. Size check
+    bbox_w = max(xs) - min(xs)
+    bbox_h = max(ys) - min(ys)
+    min_size = 0.12
+    if bbox_w < min_size or bbox_h < min_size:
+        return False, "Hand Too Small / Far"
+        
+    return True, "OK"
+
+
+def calculate_hand_movement(current_landmarks, prev_landmarks_pts) -> float:
+    """
+    Calculates average 2D landmark displacement between consecutive frames (Phase 6).
+    prev_landmarks_pts is a list/ndarray of shape (21, 2).
+    """
+    if current_landmarks is None or prev_landmarks_pts is None:
+        return 0.0
+    curr_pts = np.array([[lm.x, lm.y] for lm in current_landmarks.landmark], dtype=np.float32)
+    prev_pts = np.array(prev_landmarks_pts, dtype=np.float32)
+    if curr_pts.shape != prev_pts.shape:
+        return 0.0
+    distances = np.linalg.norm(curr_pts - prev_pts, axis=1)
+    return float(np.mean(distances))
 
 
 def draw_rounded_rect(img, pt1, pt2, color, radius=18, thickness=-1, alpha=0.7):
@@ -908,70 +995,90 @@ def draw_hud(frame, prediction, confidence, probabilities, label_names,
                       (panel_x + panel_w, panel_y + panel_h),
                       BG_DARK, radius=14, alpha=0.85)
 
-    if hand_detected and prediction:
-        # Prediction letter — large
-        letter_size = cv2.getTextSize(prediction, cv2.FONT_HERSHEY_SIMPLEX, 3.0, 4)[0]
-        letter_x = panel_x + (panel_w - letter_size[0]) // 2
-        cv2.putText(frame, prediction, (letter_x, panel_y + 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 3.0, TEAL, 4, cv2.LINE_AA)
+    if hand_detected:
+        status = state.get("hand_status", "OK")
+        if status != "OK":
+            # Display Status (e.g., "Hand Not Ready" or "Hand Moving")
+            status_color = YELLOW if status == "Hand Moving" else RED
+            status_size = cv2.getTextSize(status, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            status_x = panel_x + (panel_w - status_size[0]) // 2
+            cv2.putText(frame, status, (status_x, panel_y + 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2, cv2.LINE_AA)
 
-        # Confidence percentage
-        conf_text = f"{confidence * 100:.1f}%"
-        conf_color = GREEN if confidence > 0.85 else YELLOW if confidence > 0.5 else RED
-        conf_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-        conf_x = panel_x + (panel_w - conf_size[0]) // 2
-        cv2.putText(frame, conf_text, (conf_x, panel_y + 110),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, conf_color, 2, cv2.LINE_AA)
+            detail = state.get("hand_status_detail", "")
+            if detail:
+                detail_size = cv2.getTextSize(detail, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+                detail_x = panel_x + (panel_w - detail_size[0]) // 2
+                cv2.putText(frame, detail, (detail_x, panel_y + 135),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, GRAY, 1, cv2.LINE_AA)
+        elif prediction:
+            # Determine prediction display (Unknown if confidence < CONFIDENCE_THRESHOLD)
+            is_confident = (confidence >= CONFIDENCE_THRESHOLD)
+            display_pred = prediction if is_confident else "Unknown"
+            
+            # Prediction letter — large
+            pred_color = TEAL if is_confident else RED
+            letter_size = cv2.getTextSize(display_pred, cv2.FONT_HERSHEY_SIMPLEX, 2.2 if not is_confident else 3.0, 4)[0]
+            letter_x = panel_x + (panel_w - letter_size[0]) // 2
+            cv2.putText(frame, display_pred, (letter_x, panel_y + 80),
+                        cv2.FONT_HERSHEY_SIMPLEX, 2.2 if not is_confident else 3.0, pred_color, 3 if not is_confident else 4, cv2.LINE_AA)
 
-        # Confidence bar
-        draw_confidence_bar(frame, panel_x + 20, panel_y + 120,
-                            panel_w - 40, 14, confidence, conf_color)
+            # Confidence percentage
+            conf_text = f"{confidence * 100:.1f}%"
+            conf_color = GREEN if is_confident else RED
+            conf_size = cv2.getTextSize(conf_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+            conf_x = panel_x + (panel_w - conf_size[0]) // 2
+            cv2.putText(frame, conf_text, (conf_x, panel_y + 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, conf_color, 2, cv2.LINE_AA)
 
-        # ── Hold-time progress (temporal feedback) ──────────────────────────
-        y_hold = panel_y + 150
-        if state["is_holding"]:
-            elapsed = state["hold_elapsed"]
-            progress = elapsed / HOLD_TIME_REQUIRED
-            hold_text = f"Hold: {elapsed:.1f} / {HOLD_TIME_REQUIRED:.1f}s"
-            # Color transitions from orange → green as progress increases
-            bar_color = GREEN if progress > 0.8 else ORANGE
-            cv2.putText(frame, hold_text, (panel_x + 15, y_hold),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, YELLOW, 1, cv2.LINE_AA)
-            draw_hold_progress_bar(frame, panel_x + 20, y_hold + 6,
-                                   panel_w - 40, 12, progress, bar_color)
-            y_hold += 32
-        elif state["locked_until_reset"]:
-            cv2.putText(frame, "Locked (change sign or remove hand)",
-                        (panel_x + 12, y_hold),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, GRAY, 1, cv2.LINE_AA)
-            y_hold += 22
-        elif confidence < CONFIDENCE_THRESHOLD:
-            cv2.putText(frame, f"Low confidence (<{CONFIDENCE_THRESHOLD*100:.0f}%)",
-                        (panel_x + 12, y_hold),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, RED, 1, cv2.LINE_AA)
-            y_hold += 22
-        else:
-            y_hold += 5  # small gap
+            # Confidence bar
+            draw_confidence_bar(frame, panel_x + 20, panel_y + 120,
+                                panel_w - 40, 14, confidence, conf_color)
 
-        # ── Top-3 predictions ───────────────────────────────────────────────
-        top_indices = np.argsort(probabilities)[::-1][:3]
-        y_offset = y_hold + 10
-        cv2.putText(frame, "Top Predictions:", (panel_x + 15, y_offset),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, GRAY, 1, cv2.LINE_AA)
-        y_offset += 28
-        for rank, idx in enumerate(top_indices, 1):
-            lbl = label_names[idx]
-            prob = probabilities[idx]
-            bar_color = TEAL if rank == 1 else TEAL_LIGHT
-            text = f"{rank}. {lbl}"
-            cv2.putText(frame, text, (panel_x + 15, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1, cv2.LINE_AA)
-            draw_confidence_bar(frame, panel_x + 60, y_offset - 10,
-                                panel_w - 90, 10, prob, bar_color)
-            pct = f"{prob * 100:.1f}%"
-            cv2.putText(frame, pct, (panel_x + panel_w - 55, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, GRAY, 1, cv2.LINE_AA)
+            # ── Hold-time progress (temporal feedback) ──────────────────────────
+            y_hold = panel_y + 150
+            if state["is_holding"]:
+                elapsed = state["hold_elapsed"]
+                progress = elapsed / HOLD_TIME_REQUIRED
+                hold_text = f"Hold: {elapsed:.1f} / {HOLD_TIME_REQUIRED:.1f}s"
+                bar_color = GREEN if progress > 0.8 else ORANGE
+                cv2.putText(frame, hold_text, (panel_x + 15, y_hold),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.48, YELLOW, 1, cv2.LINE_AA)
+                draw_hold_progress_bar(frame, panel_x + 20, y_hold + 6,
+                                       panel_w - 40, 12, progress, bar_color)
+                y_hold += 32
+            elif state["locked_until_reset"]:
+                cv2.putText(frame, "Locked (change sign/remove hand)",
+                            (panel_x + 12, y_hold),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, GRAY, 1, cv2.LINE_AA)
+                y_hold += 22
+            elif not is_confident:
+                cv2.putText(frame, f"Low confidence (<{CONFIDENCE_THRESHOLD*100:.0f}%)",
+                            (panel_x + 12, y_hold),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, RED, 1, cv2.LINE_AA)
+                y_hold += 22
+            else:
+                y_hold += 5  # small gap
+
+            # ── Top-3 predictions ───────────────────────────────────────────────
+            top_indices = np.argsort(probabilities)[::-1][:3]
+            y_offset = y_hold + 10
+            cv2.putText(frame, "Top Predictions:", (panel_x + 15, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, GRAY, 1, cv2.LINE_AA)
             y_offset += 28
+            for rank, idx in enumerate(top_indices, 1):
+                lbl = label_names[idx]
+                prob = probabilities[idx]
+                bar_color = TEAL if rank == 1 else TEAL_LIGHT
+                text = f"{rank}. {lbl}"
+                cv2.putText(frame, text, (panel_x + 15, y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1, cv2.LINE_AA)
+                draw_confidence_bar(frame, panel_x + 60, y_offset - 10,
+                                    panel_w - 90, 10, prob, bar_color)
+                pct = f"{prob * 100:.1f}%"
+                cv2.putText(frame, pct, (panel_x + panel_w - 55, y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, GRAY, 1, cv2.LINE_AA)
+                y_offset += 28
     else:
         # No hand detected
         msg = "No Hand Detected"
@@ -1204,6 +1311,9 @@ def main():
     prev_time = time.time()
     fps = 0.0
 
+    # Hand motion tracking
+    prev_landmarks_pts = None
+
     print("[STATE] Temporal logic engine active:")
     print(f"        History window:   {HISTORY_SIZE} frames")
     print(f"        Consistency:      >{CONSISTENCY_THRESHOLD*100:.0f}%")
@@ -1243,6 +1353,9 @@ def main():
         # ================================================================
         # HAND DETECTED → run prediction + temporal logic
         # ================================================================
+        hand_status = "No Hand Detected"
+        hand_status_detail = ""
+
         if results.multi_hand_landmarks:
             hand_detected = True
             hand_lm = results.multi_hand_landmarks[0]
@@ -1254,88 +1367,129 @@ def main():
                 mp_styles.get_default_hand_connections_style(),
             )
 
-            # Extract features & predict
-            features = extract_landmarks(hand_lm)
-            features_scaled = scaler.transform(features)
+            # ── Step 1: Hand Quality Check (Phase 7) ─────────────────────
+            quality_ok, quality_msg = check_hand_quality(hand_lm)
+            
+            # ── Step 2: Motion Check (Phase 6) ───────────────────────────
+            is_moving = False
+            movement_val = 0.0
+            if prev_landmarks_pts is not None:
+                movement_val = calculate_hand_movement(hand_lm, prev_landmarks_pts)
+                if movement_val > 0.015:
+                    is_moving = True
+            # Store current landmarks for next frame motion check
+            prev_landmarks_pts = [[lm.x, lm.y] for lm in hand_lm.landmark]
 
-            current_prediction = le.inverse_transform(model.predict(features_scaled))[0]
-            probabilities = model.predict_proba(features_scaled)[0]
-            confidence = float(np.max(probabilities))
-
-            # ── Step 1: Append to prediction history ────────────────────
-            prediction_history.append(current_prediction)
-
-            # ── Step 2: Majority voting ─────────────────────────────────
-            stable_prediction, consistency_ratio = get_majority_prediction(
-                prediction_history, CONSISTENCY_THRESHOLD
-            )
-
-            # ── Step 3: Temporal decision logic ─────────────────────────
-            if stable_prediction is not None and confidence >= CONFIDENCE_THRESHOLD:
-                # We have a consistent, high-confidence prediction
-
-                # Check if locked: same letter was just added
-                if locked_until_reset and stable_prediction == last_added_letter:
-                    # LOCKED: user must remove hand or change sign
-                    hold_timer_start = None  # don't accumulate hold time
-
-                elif stable_prediction != last_added_letter:
-                    # NEW LETTER detected (different from the locked one)
-                    # This automatically unlocks the system
-                    locked_until_reset = False
-
-                    if hold_timer_start is None:
-                        # Start the hold timer for this new stable prediction
-                        hold_timer_start = now
-                    else:
-                        # Check if held long enough
-                        hold_elapsed = now - hold_timer_start
-                        if hold_elapsed >= HOLD_TIME_REQUIRED:
-                            # ── COMMIT THE LETTER ───────────────────────
-                            word_buffer.append(stable_prediction)
-                            word_confidences.append(confidence)
-                            last_added_letter = stable_prediction
-                            locked_until_reset = True
-                            hold_timer_start = None
-
-                            # Set feedback
-                            feedback_message = f"Added: {stable_prediction}"
-                            feedback_timestamp = now
-
-                            print(f"[COMMIT] '{stable_prediction}' added. "
-                                  f"Word: {''.join(word_buffer)}")
-
-                else:
-                    # Same letter, but not locked (first occurrence)
-                    if hold_timer_start is None:
-                        hold_timer_start = now
-                    else:
-                        hold_elapsed = now - hold_timer_start
-                        if hold_elapsed >= HOLD_TIME_REQUIRED:
-                            # ── COMMIT THE LETTER ───────────────────────
-                            word_buffer.append(stable_prediction)
-                            word_confidences.append(confidence)
-                            last_added_letter = stable_prediction
-                            locked_until_reset = True
-                            hold_timer_start = None
-
-                            feedback_message = f"Added: {stable_prediction}"
-                            feedback_timestamp = now
-
-                            print(f"[COMMIT] '{stable_prediction}' added. "
-                                  f"Word: {''.join(word_buffer)}")
-            else:
-                # Prediction is unstable or low-confidence: reset hold timer
+            if not quality_ok:
+                hand_status = "Hand Not Ready"
+                hand_status_detail = quality_msg
+                current_prediction = None
+                confidence = 0.0
+                prediction_history.clear()
                 hold_timer_start = None
+            elif is_moving:
+                hand_status = "Hand Moving"
+                hand_status_detail = f"Speed: {movement_val:.3f}"
+                current_prediction = None
+                confidence = 0.0
+                # Pause the hold timer while hand is moving rapidly
+                hold_timer_start = None
+            else:
+                hand_status = "OK"
+                hand_status_detail = ""
+
+                # Extract features based on model expectation (Compatibility Mode)
+                if MODEL_EXPECTS_ENHANCED:
+                    features = extract_enhanced_features(hand_lm).reshape(1, -1)
+                else:
+                    features = extract_landmarks(hand_lm).reshape(1, -1)
+
+                features_scaled = scaler.transform(features)
+                current_prediction = le.inverse_transform(model.predict(features_scaled))[0]
+                probabilities = model.predict_proba(features_scaled)[0]
+                confidence = float(np.max(probabilities))
+
+                # ── Step 3: Confidence Filtering (Phase 3) ───────────────────
+                # Only accept predictions with >= 95% confidence
+                filtered_pred = current_prediction if confidence >= CONFIDENCE_THRESHOLD else "Unknown"
+
+                # ── Step 4: Append to prediction history ─────────────────────
+                prediction_history.append(filtered_pred)
+
+                # ── Step 5: Majority voting (Phases 4 & 5) ───────────────────
+                stable_prediction, consistency_ratio = get_majority_prediction(
+                    prediction_history, CONSISTENCY_THRESHOLD
+                )
+
+                # ── Step 6: Temporal decision logic ──────────────────────────
+                if stable_prediction is not None and stable_prediction != "Unknown":
+                    # We have a consistent, high-confidence prediction
+
+                    # Check if locked: same letter was just added
+                    if locked_until_reset and stable_prediction == last_added_letter:
+                        # LOCKED: user must remove hand or change sign
+                        hold_timer_start = None  # don't accumulate hold time
+
+                    elif stable_prediction != last_added_letter:
+                        # NEW LETTER detected (different from the locked one)
+                        # This automatically unlocks the system
+                        locked_until_reset = False
+
+                        if hold_timer_start is None:
+                            # Start the hold timer for this new stable prediction
+                            hold_timer_start = now
+                        else:
+                            # Check if held long enough
+                            hold_elapsed = now - hold_timer_start
+                            if hold_elapsed >= HOLD_TIME_REQUIRED:
+                                # ── COMMIT THE LETTER ───────────────────────
+                                word_buffer.append(stable_prediction)
+                                word_confidences.append(confidence)
+                                last_added_letter = stable_prediction
+                                locked_until_reset = True
+                                hold_timer_start = None
+
+                                # Set feedback
+                                feedback_message = f"Added: {stable_prediction}"
+                                feedback_timestamp = now
+
+                                print(f"[COMMIT] '{stable_prediction}' added. "
+                                      f"Word: {''.join(word_buffer)}")
+
+                    else:
+                        # Same letter, but not locked (first occurrence)
+                        if hold_timer_start is None:
+                            hold_timer_start = now
+                        else:
+                            hold_elapsed = now - hold_timer_start
+                            if hold_elapsed >= HOLD_TIME_REQUIRED:
+                                # ── COMMIT THE LETTER ───────────────────────
+                                word_buffer.append(stable_prediction)
+                                word_confidences.append(confidence)
+                                last_added_letter = stable_prediction
+                                locked_until_reset = True
+                                hold_timer_start = None
+
+                                feedback_message = f"Added: {stable_prediction}"
+                                feedback_timestamp = now
+
+                                print(f"[COMMIT] '{stable_prediction}' added. "
+                                      f"Word: {''.join(word_buffer)}")
+                else:
+                    # Prediction is unstable, unknown, or low-confidence: reset hold timer
+                    hold_timer_start = None
 
         # ================================================================
         # NO HAND DETECTED → reset all temporal state
         # ================================================================
         else:
+            hand_status = "No Hand Detected"
+            hand_status_detail = ""
             current_prediction = None
             confidence = 0.0
             prediction_history.clear()
             hold_timer_start = None
+            prev_landmarks_pts = None
 
             # Hand removal resets the lock, allowing the same letter next time
             if locked_until_reset:
@@ -1421,6 +1575,8 @@ def main():
             "emergency_trigger_time": emergency_trigger_time,
             "emergency_language": emergency_language,
             "emergency_count_today": emergency_count_today,
+            "hand_status": hand_status,
+            "hand_status_detail": hand_status_detail,
         }
 
         # ── FPS ─────────────────────────────────────────────────────────

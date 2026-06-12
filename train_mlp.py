@@ -22,6 +22,7 @@ import numpy as np
 import cv2
 import mediapipe as mp
 from tqdm import tqdm
+from utils import extract_enhanced_features  # Enhanced landmarks and engineered features
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -42,6 +43,7 @@ CM_PATH = os.path.join(MODEL_DIR, "confusion_matrix.png")
 
 VALID_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
 LABELS = list(string.ascii_uppercase)  # A-Z only
+LIMIT_SAMPLES_PER_GESTURE = 200  # Set to None for full training (3000/class). Set to a number (e.g. 200) for faster training.
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -64,10 +66,8 @@ def extract_landmarks() -> str:
         min_detection_confidence=0.5,
     )
 
-    # Build CSV header: x1,y1,z1, ..., x21,y21,z21, label
-    header = []
-    for i in range(1, 22):
-        header.extend([f"x{i}", f"y{i}", f"z{i}"])
+    # Build CSV header for 99 features: f0, f1, ..., f98, label
+    header = [f"f{i}" for i in range(99)]
     header.append("label")
 
     total_images = 0
@@ -89,6 +89,8 @@ def extract_landmarks() -> str:
                 for fn in os.listdir(folder)
                 if fn.lower().endswith(VALID_EXTENSIONS)
             ]
+            if LIMIT_SAMPLES_PER_GESTURE is not None:
+                files = sorted(files)[:LIMIT_SAMPLES_PER_GESTURE]
             total_images += len(files)
 
             for fn in tqdm(files, desc=f"  {label}", unit="img", leave=False):
@@ -103,9 +105,8 @@ def extract_landmarks() -> str:
 
                 if results.multi_hand_landmarks:
                     hand = results.multi_hand_landmarks[0]
-                    row = []
-                    for lm in hand.landmark:
-                        row.extend([lm.x, lm.y, lm.z])
+                    # Extract 99-dimensional enhanced features
+                    row = list(extract_enhanced_features(hand))
                     row.append(label)
                     writer.writerow(row)
                     processed += 1
@@ -124,14 +125,69 @@ def extract_landmarks() -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 #  STEP 2 — Train MLP
 # ═════════════════════════════════════════════════════════════════════════════
+def augment_landmarks_and_recompute(coords):
+    """
+    Applies data augmentation (Rotation, Scaling, Noise) to 3D hand coordinates,
+    then re-extracts the 99 enhanced features.
+    """
+    # 1. Rotation: Rotate around Z-axis (in-plane rotation) by a random angle [-15, 15] degrees
+    angle = np.random.uniform(-15, 15) * np.pi / 180.0
+    cos_a, sin_a = np.cos(angle), np.sin(angle)
+    rot_mat = np.array([
+        [cos_a, -sin_a, 0],
+        [sin_a, cos_a, 0],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    rotated = np.dot(coords, rot_mat.T)
+    
+    # 2. Scaling: slight hand size variation [0.95, 1.05]
+    scale = np.random.uniform(0.95, 1.05)
+    scaled = rotated * scale
+    
+    # 3. Noise injection: simulate tracking jitter
+    noise = np.random.normal(0, 0.005, size=coords.shape).astype(np.float32)
+    jittered = scaled + noise
+    
+    # Re-extract engineered features from augmented coordinates
+    return extract_enhanced_features(jittered)
+
+
+def augment_dataset(X_raw, y_raw, factor=3):
+    """
+    Augments the raw feature dataset.
+    For each sample, we keep the original and add `factor` augmented copies.
+    """
+    X_aug = []
+    y_aug = []
+    
+    for i in range(len(X_raw)):
+        sample = X_raw[i]
+        label = y_raw[i]
+        
+        # Keep original
+        X_aug.append(sample)
+        y_aug.append(label)
+        
+        # The first 63 features are the 21 normalized landmarks (x, y, z)
+        coords = sample[:63].reshape(21, 3)
+        
+        # Generate augmented copies
+        for _ in range(factor):
+            aug_feat = augment_landmarks_and_recompute(coords)
+            X_aug.append(aug_feat)
+            y_aug.append(label)
+            
+    return np.array(X_aug, dtype=np.float32), np.array(y_aug)
+
+
 def train_mlp(csv_path: str):
     """
-    Load the landmark CSV, scale features, train an MLPClassifier,
+    Load the landmark CSV, augment features, scale features, train an MLPClassifier,
     and persist the model + encoder + scaler to disk.
     Returns (model, label_encoder, scaler, X_test, y_test).
     """
     print("\n" + "=" * 60)
-    print("  STEP 2 - Training MLP Classifier")
+    print("  STEP 2 - Training MLP Classifier with Data Augmentation")
     print("=" * 60)
 
     # ── Load data ───────────────────────────────────────────────────────────
@@ -149,16 +205,23 @@ def train_mlp(csv_path: str):
     le = LabelEncoder()
     y_encoded = le.fit_transform(y)
 
+    # ── Train / test split on RAW features first ────────────────────────────
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
+    )
+    print(f"  Raw train samples: {len(X_train_raw)}")
+    print(f"  Raw test samples : {len(X_test_raw)}")
+
+    # ── Apply Data Augmentation to the training set only ───────────────────
+    print("\n  Augmenting training set (rotation, scaling, noise injection)...")
+    X_train_aug, y_train_aug = augment_dataset(X_train_raw, y_train, factor=3)
+    print(f"  Augmented train samples: {len(X_train_aug)}")
+
     # ── Scale features ──────────────────────────────────────────────────────
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # ── Train / test split ──────────────────────────────────────────────────
-    X_train, X_test, y_train, y_test = train_test_split(
-        X_scaled, y_encoded, test_size=0.2, random_state=42, stratify=y_encoded
-    )
-    print(f"  Train samples   : {len(X_train)}")
-    print(f"  Test  samples   : {len(X_test)}")
+    X_train = scaler.fit_transform(X_train_aug)
+    X_test = scaler.transform(X_test_raw)
+    y_train = y_train_aug  # use augmented labels for training
 
     # ── Build & fit MLP ─────────────────────────────────────────────────────
     mlp = MLPClassifier(
