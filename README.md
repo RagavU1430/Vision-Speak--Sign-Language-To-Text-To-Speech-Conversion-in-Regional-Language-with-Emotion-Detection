@@ -345,8 +345,7 @@ into a single assistive communication platform.
 # 👨‍💻 Developed By
 
 **Ragav**
-
-AI-Powered Sign Language Communication System
+Artificial Intelligence & Data Science Student
 
 ---
 
